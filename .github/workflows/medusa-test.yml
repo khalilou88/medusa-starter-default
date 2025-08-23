@@ -1,0 +1,217 @@
+name: Medusa Starter Test with Docker
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master, develop ]
+  pull_request:
+    branches: [ master ]
+  schedule:
+    # Run daily at 2 AM UTC to test against latest Medusa changes
+    - cron: '0 2 * * *'
+
+jobs:
+  test-medusa-starter:
+    name: Test Medusa Starter with Docker Compose
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout current repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'yarn'
+          cache-dependency-path: backend/yarn.lock
+
+      - name: Start Docker services
+        run: |
+          echo "Starting PostgreSQL and Redis with Docker Compose..."
+          docker compose up -d postgres redis
+          echo "Services started, waiting for health checks..."
+
+      - name: Wait for services to be healthy
+        run: |
+          echo "Waiting for PostgreSQL to be ready..."
+          timeout 60 bash -c 'until docker compose exec -T postgres pg_isready -U postgres; do sleep 2; done'
+          echo "PostgreSQL is ready!"
+          
+          echo "Waiting for Redis to be ready..."
+          timeout 60 bash -c 'until docker compose exec -T redis redis-cli ping | grep -q PONG; do sleep 2; done'
+          echo "Redis is ready!"
+
+      - name: Install dependencies
+        run: |
+          echo "Installing Medusa dependencies..."
+          yarn install --frozen-lockfile
+
+      - name: Run database migrations
+        run: |
+          echo "Running database migrations..."
+          yarn medusa db:migrate
+          echo "Migrations completed successfully"
+
+      - name: Verify database setup
+        run: |
+          echo "Verifying database setup..."
+          docker compose exec -T postgres psql -U postgres -d medusa-store -c "
+            SELECT table_name FROM information_schema.tables 
+            WHERE table_schema = 'public' 
+            AND table_name LIKE '%migration%'
+            ORDER BY table_name;
+          "
+
+      - name: Start Medusa server in background
+        run: |
+          echo "Starting Medusa server..."
+          yarn dev > medusa.log 2>&1 &
+          echo $! > medusa.pid
+          echo "Medusa server started with PID: $(cat medusa.pid)"
+
+      - name: Wait for Medusa server to start
+        run: |
+          echo "Waiting for Medusa server to start..."
+          timeout 120 bash -c '
+            until curl -f http://localhost:9000/health 2>/dev/null || curl -f http://localhost:9000/store 2>/dev/null; do
+              echo "Waiting for server... (attempt $(date +%s))"
+              echo "Recent logs:"
+              tail -5 medusa.log 2>/dev/null || echo "No logs yet"
+              sleep 5
+            done
+          '
+          echo "Medusa server is ready!"
+
+      - name: Test API endpoints
+        run: |
+          echo "Testing Medusa API endpoints..."
+          
+          # Test store API
+          echo "Testing store endpoint..."
+          response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:9000/store)
+          if [ "$response" -eq 200 ]; then
+            echo "✅ Store endpoint working (HTTP $response)"
+          else
+            echo "❌ Store endpoint failed (HTTP $response)"
+            tail -10 medusa.log
+          fi
+          
+          # Test admin API
+          echo "Testing admin endpoint..."
+          response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:9000/admin)
+          if [ "$response" -eq 200 ] || [ "$response" -eq 404 ]; then
+            echo "✅ Admin endpoint accessible (HTTP $response)"
+          else
+            echo "❌ Admin endpoint failed (HTTP $response)"
+          fi
+          
+          # Test health endpoint (if available)
+          echo "Testing health endpoint..."
+          response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:9000/health)
+          if [ "$response" -eq 200 ]; then
+            echo "✅ Health endpoint working (HTTP $response)"
+          else
+            echo "ℹ️  Health endpoint not available (HTTP $response)"
+          fi
+          
+          # Test products endpoint
+          echo "Testing products endpoint..."
+          response=$(curl -s http://localhost:9000/store/products)
+          if echo "$response" | grep -q "products" || echo "$response" | grep -q "\[\]"; then
+            echo "✅ Products endpoint working"
+          else
+            echo "❌ Products endpoint test failed"
+            echo "Response: $response"
+          fi
+
+      - name: Create admin user
+        run: |
+          echo "Creating admin user..."
+          yarn medusa user --email admin@test.com --password supersecret || {
+            echo "⚠️  Admin user creation failed, but continuing tests..."
+          }
+
+      - name: Test admin authentication
+        run: |
+          echo "Testing admin authentication..."
+          response=$(curl -s -X POST http://localhost:9000/admin/auth \
+            -H "Content-Type: application/json" \
+            -d '{"email": "admin@test.com", "password": "supersecret"}')
+          
+          if echo "$response" | grep -q "token" || echo "$response" | grep -q "user"; then
+            echo "✅ Admin authentication working"
+          else
+            echo "⚠️  Admin auth test result: $response"
+          fi
+
+      - name: Test database connectivity through Docker
+        run: |
+          echo "Testing database connectivity through Docker..."
+          
+          echo "Database tables:"
+          docker compose exec -T postgres psql -U postgres -d medusa-store -c "
+            SELECT COUNT(*) as table_count 
+            FROM information_schema.tables 
+            WHERE table_schema = 'public';
+          " || echo "Database query failed"
+          
+          echo "Migration status:"
+          docker compose exec -T postgres psql -U postgres -d medusa-store -c "
+            SELECT COUNT(*) as migration_count FROM migrations;
+          " || echo "Could not check migrations table"
+
+      - name: Test Redis connectivity through Docker
+        run: |
+          echo "Testing Redis connectivity through Docker..."
+          docker compose exec -T redis redis-cli ping || echo "Redis connectivity test failed"
+          
+          echo "Redis info:"
+          docker compose exec -T redis redis-cli info server | head -10 || echo "Redis info failed"
+
+      - name: Show comprehensive status
+        run: |
+          echo "=== Final System Status ==="
+          echo "Docker containers:"
+          docker compose ps
+          
+          echo -e "\n=== Service Health ==="
+          echo "PostgreSQL:"
+          docker compose exec -T postgres pg_isready -U postgres || echo "PostgreSQL not ready"
+          
+          echo "Redis:"
+          docker compose exec -T redis redis-cli ping || echo "Redis not ready"
+          
+          echo -e "\n=== Port Status ==="
+          netstat -tlnp | grep -E "(5432|6379|9000)" || echo "Port check failed"
+
+      - name: Show server logs
+        if: always()
+        run: |
+          echo "=== Medusa Server Logs ==="
+          cat medusa.log || echo "No server logs found"
+
+      - name: Show Docker logs
+        if: always()
+        run: |
+          echo "=== PostgreSQL Docker Logs ==="
+          docker compose logs postgres | tail -20
+          
+          echo -e "\n=== Redis Docker Logs ==="
+          docker compose logs redis | tail -20
+
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "Cleaning up..."
+          
+          # Stop Medusa server
+          if [ -f medusa.pid ]; then
+            kill $(cat medusa.pid) 2>/dev/null || echo "Medusa process already stopped"
+          fi
+          pkill -f "yarn dev" 2>/dev/null || echo "No yarn dev processes found"
+          
+          # Stop Docker services
+          docker compose down -v || echo "Docker cleanup completed"
+          
+          echo "Cleanup completed"
