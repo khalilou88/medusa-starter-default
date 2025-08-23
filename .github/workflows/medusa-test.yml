@@ -24,7 +24,7 @@ jobs:
         with:
           node-version: '20'
           cache: 'yarn'
-          cache-dependency-path: backend/yarn.lock
+          cache-dependency-path: yarn.lock
 
       - name: Start Docker services
         run: |
